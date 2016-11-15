@@ -1,288 +1,177 @@
-#include <linux/list.h>
-#include <linux/compiler.h>
-#include <linux/kernel.h>
-#include <linux/export.h>
-#include <linux/sched.h>
-#include <linux/semaphore.h>
-#include <linux/spinlock.h>
-#include <linux/ftrace.h>
 #include <linux/unistd.h>
 #include <linux/errno.h>
+#include <linux/kernel.h>
+#include <linux/sched.h>
+#include <linux/list.h>
+#include <linux/spinlock.h>
 #include <linux/random.h>
 
 #define NUM_SEMA 10
-#define FIFO 0
-#define OS_PRI 1
-#define USER_PRI 2
 
-typedef struct mysemaphore {
-    raw_spinlock_t      lock; 
-    unsigned int        count;
-    struct list_head    wait_list;
-    int                 mode;
-    bool                is_active;
-} mysemaphore_t;
+struct mysemaphore {
+	raw_spinlock_t lock; // lock 
+	unsigned int count; // semaphore value
+	struct list_head wait_list; // semaphore_waiters structures for this semaphore
+	int mode; // 0 for FIFO non-0 for alternative(random)
+	bool isActive; // 0 for inactive, 1 for active
+};
 
-typedef struct mysemaphore_waiter {
-    struct list_head list;
-    struct task_struct *task;
-    int userprio;
-    bool up;
-} mysemaphore_waiter_t ;
+struct semaphore_waiter {
+	struct list_head list; // list structrue
+	struct task_struct *task; // waiting process or threads
+	bool up; // waiter's status: whether it is waiting for semaphore or not
+};
 
-asmlinkage long sys_mysema_init(int sema_id, int start_value, int mode);
-asmlinkage long sys_mysema_down(int sema_id);
-asmlinkage long sys_mysema_down_userprio(int sema_id, int priority);
-asmlinkage long sys_mysema_up(int sema_id);
-asmlinkage long sys_mysema_release(int sema_id);
+// global 10 semaphores used in my_semaphore.
+static struct mysemaphore my_sema[10];
 
-static mysemaphore_t mysema_arr[NUM_SEMA];
+asmlinkage long sys_mysema_init (int sema_id, int start_value, int mode){
+	static struct lock_class_key __key;
 
-asmlinkage long sys_mysema_init(int sema_id, int start_value, int mode)
-{
-    static struct lock_class_key __key;
-    static bool is_first = true;
+	// check validity of sema_id
+	if (sema_id < 0 || sema_id > 9)
+		return -1;
 
-    if(!is_first && mysema_arr[sema_id].is_active== true)
-    {
-        printk("mysema_init: active sema\n");
-        return -1;
-    }
+	// check whether semaphore is already active.
+	if (my_sema[sema_id].isActive)
+		return -1;
 
-    if(sema_id < 0 || sema_id > 9)
-    {
-        printk("mysema_init: wrong sema id\n");
-        return -1;
-    }
+	// check validity of start value.
+	if (start_value < 0)
+		return -1;
 
-    if(start_value < 0)
-    {
-        printk("mysema_init: wrong start value\n");
-        return -1;
-    }
-
-    mysema_arr[sema_id].lock = __RAW_SPIN_LOCK_UNLOCKED(mysema_arr[sema_id].lock);
-    mysema_arr[sema_id].count = start_value;
-    //mysema_arr[sema_id].wait_list = (struct list_head) LIST_HEAD_INIT(mysema_arr[sema_id].wait_list);	
-    INIT_LIST_HEAD(&mysema_arr[sema_id].wait_list);
-    mysema_arr[sema_id].mode = mode;
-    mysema_arr[sema_id].is_active = true;
-    lockdep_init_map(&mysema_arr[sema_id]->lock.dep_map, "semaphore->lock", &__key, 0);
-
-    printk("sema %d is initialized\n", sema_id);
-    is_first = false;
-    return 0;
+	// initialize the lock
+	my_sema[sema_id].lock = __RAW_SPIN_LOCK_UNLOCKED(my_sema[sema_id].lock);
+	// initialize the semaphore value with start_value
+	my_sema[sema_id].count = start_value;
+	// initialize the list for waiters 
+	INIT_LIST_HEAD(&my_sema[sema_id].wait_list);
+	// assigning mode
+	my_sema[sema_id].mode = mode;
+	// activate the semaphore
+	my_sema[sema_id].isActive = true;
+	// initialize the lockdep map.
+	lockdep_init_map(&my_sema[sema_id]->lock.dep_map, "semaphore->lock", &__key, 0);
+	return 0;
 }
 
-asmlinkage long sys_mysema_down(int sema_id)
-{
-    unsigned long flags;
-    long return_status = 0;
+asmlinkage long sys_mysema_down (int sema_id){
+	unsigned long flags;
 
-    if(sema_id < 0 || sema_id > 9)
-    {
-        printk("mysema_down: wrong sema_id\n");
-        return -1;
-    }
+	// check validity of sema_id
+	if (sema_id < 0 || sema_id > 9)
+		return -1;
 
-    if(mysema_arr[sema_id].is_active == false)
-    {
-        printk("mysema_down: inactive sema\n");
-        return -1;
-    }
+	// check whether semaphore is active
+	if (!my_sema[sema_id].isActive)
+		return -1;
 
-    if(mysema_arr[sema_id].mode == USER_PRI)
-        return sys_mysema_down_userprio(sema_id, 100);
+	// acquire the lock
+	raw_spin_lock_irqsave(&my_sema[sema_id].lock,flags);
+	if (likely (my_sema[sema_id].count > 0))
+		// if semaphore value is more than 0
+		my_sema[sema_id].count--;
+	else{
+		// if semaphore value is less than or equal to 0, it needs to sleep.
+		struct task_struct *task = current;	// current task_struct
+		struct semaphore_waiter waiter;
 
-    raw_spin_lock_irqsave(&mysema_arr[sema_id].lock, flags);
-    if (likely(mysema_arr[sema_id].count > 0))
-        mysema_arr[sema_id].count--;
-    else
-    {
-        struct task_struct *task = current;
-        mysemaphore_waiter_t waiter;
+		// add to the semaphores waiter list.
+		list_add_tail (&waiter.list, &my_sema[sema_id].wait_list);
+		waiter.task = task;
+		waiter.up = false;
 
-        list_add_tail(&waiter.list, &mysema_arr[sema_id].wait_list);
-        waiter.task = task;
-        waiter.up = false;
-
-                
-        for(;;)
-        {
-            __set_task_state(task, TASK_UNINTERRUPTIBLE);
-            raw_spin_unlock_irq(&mysema_arr[sema_id].lock);
-            raw_spin_lock_irq(&mysema_arr[sema_id].lock);
-            if(waiter.up == true)
-            {
-                printk("mysema_down: thread wake up\n");
-                return_status = 0;
-                break;
-            }
-        }
-    }
-    raw_spin_unlock_irqrestore(&mysema_arr[sema_id].lock, flags);
-    printk("sema %d down end\n", sema_id);
-    return return_status;
+		// busy waiting until waiter.up to be true.
+		for(;;){
+			__set_task_state(task, TASK_UNINTERRUPTIBLE);
+			raw_spin_unlock_irq(&my_sema[sema_id].lock);
+			raw_spin_lock_irq(&my_sema[sema_id].lock);
+			if (waiter.up)
+				break;
+		}
+	}
+	// release the lock.
+	raw_spin_unlock_irqrestore(&my_sema[sema_id].lock, flags);
+	return 0;
 }
 
-asmlinkage long sys_mysema_down_userprio(int sema_id, int priority)
-{
-    unsigned long flags;
-    long return_status = 0;
+asmlinkage long sys_mysema_up (int sema_id){
+	unsigned long flags;
+	
+	// check validity of sema_id
+	if (sema_id < 0 || sema_id > 9)
+		return -1;
 
-    if(sema_id < 0 || sema_id > 9)
-    {
-        printk("sema_down_userprio: wrong sema_id\n");
-        return -1;
-    }
+	// check whether semaphore is active or not
+	if (!my_sema[sema_id].isActive)
+		return -1;
 
-    if(mysema_arr[sema_id].is_active == false)
-    {
-        printk("sema_down_userprio: inactive sema\n");
-        return -1;
-    }
+	// acquire the lock.
+	raw_spin_lock_irqsave(&my_sema[sema_id].lock, flags);
+	if (likely(list_empty(&my_sema[sema_id].wait_list)))
+		// if there is no waiter for semaphore, it just need to increment the semaphore value.
+		my_sema[sema_id].count++;
+	else if (my_sema[sema_id].mode == 0){ // when there is waiter for the semaphore.
+		// FIFO mode
+		// take first waiter of the waiter list
+		struct semaphore_waiter *waiter = list_first_entry (&my_sema[sema_id].wait_list,
+				struct semaphore_waiter, list);
+		// remove it from the waiter list
+		list_del (&waiter->list);
+		// change semaphore_waiter's up variable to true so that it can break busy waiting.
+		waiter->up = true;
+		// wake up the process.
+		wake_up_process(waiter->task);
+	}else {
+		// alternative mode: random mode
+		struct list_head *iter_head;
+		struct semaphore_waiter *waiter;
+		int count = 0;
+		unsigned int idx;
+		int i;
 
-    raw_spin_lock_irqsave(&mysema_arr[sema_id].lock, flags);
-    if (likely(mysema_arr[sema_id].count > 0))
-        mysema_arr[sema_id].count--;
-    else
-    {
-        struct task_struct *task = current;
-        if(current == NULL)
-            printk("mysema_down: current is NULL\n");
-        mysemaphore_waiter_t waiter;
+		// count how many waiters exist
+		list_for_each(iter_head, &my_sema[sema_id].wait_list){
+			count ++;
+		}
 
-        list_add_tail(&waiter.list, &mysema_arr[sema_id].wait_list);
-        waiter.task = task;
-        waiter.userprio = priority;
-        waiter.up = false;
-        printk("mysema_down: add waiter end\n"); 
+		// get random index range from 0 to number_of_waiter-1
+		idx = get_random_int ();
+		idx = idx%count;
+		
+		// get process from the waiter list with randomly generated index above.
+		iter_head = (&my_sema[sema_id].wait_list)->next;
+		for(i=0; i<idx; ++i)
+			iter_head = iter_head->next;
 
-        /*
-           for (;;) {
-           __set_task_state(task, TASK_UNINTERRUPTIBLE);
-           raw_spin_unlock_irq(&mysema_arr[sema_id].lock);
-           raw_spin_lock_irq(&mysema_arr[sema_id].lock);
-           if (waiter.up)
-           {
-           return_status = 0;
-           break;
-           }
-           }
-           */
-    }
-    raw_spin_unlock_irqrestore(&mysema_arr[sema_id].lock, flags);
-
-    printk("sema %d down end\n", sema_id);
-    return return_status;
+		// get process to wake up
+		waiter = list_entry (iter_head, struct semaphore_waiter, list);
+		// remove from the waiter list
+		list_del (&waiter->list);
+		// change semaphore_waiter's up variable to true so that it can break busy waiting.
+		waiter->up = true;
+		// wake up the process.
+		wake_up_process(waiter->task);	
+	}
+	// release the lock
+	raw_spin_unlock_irqrestore(&my_sema[sema_id].lock, flags);
+	return 0;
 }
 
-asmlinkage long sys_mysema_up(int sema_id)
-{
-    unsigned long flags;
+asmlinkage long sys_mysema_release (int sema_id){
+	// check validity of the sema_id
+	if (sema_id < 0 || sema_id > 9)
+		return -1;
 
-    if(sema_id < 0 || sema_id > 9)
-    {
-        printk("sema_up: wrong sema_id\n");
-        return -1;
-    }
+	// check whether semaphore is active or not
+	if (!my_sema[sema_id].isActive)
+		return -1;
 
-    if(mysema_arr[sema_id].is_active == false)
-    {
-        printk("sema_up: inactive sema\n");
-        return -1;
-    }
+	// assure there is no waiter for this semaphore.
+	if (!list_empty(&my_sema[sema_id].wait_list))
+		return -1;
 
-    raw_spin_lock_irqsave(&mysema_arr[sema_id].lock, flags);
-    if (likely(list_empty(&mysema_arr[sema_id].wait_list)))
-        mysema_arr[sema_id].count++;
-    else
-    {
-        mysemaphore_waiter_t *waiter = NULL, *iter_wait;
-        int priority = 0;
-        printk("mysema_up: mode: %d\n", mysema_arr[sema_id].mode);
-        switch(mysema_arr[sema_id].mode)
-        {
-            case FIFO:
-                waiter = list_first_entry(&mysema_arr[sema_id].wait_list,
-                        mysemaphore_waiter_t, list);
-                printk("FIFO mode\n");
-                break;
-
-            case OS_PRI:
-                list_for_each_entry(iter_wait, &mysema_arr[sema_id].wait_list, list)
-                {
-                    if(iter_wait->task->prio > priority)
-                    {
-                        waiter = iter_wait;
-                        priority = iter_wait->task->prio;
-                    }
-                }
-                if(waiter == NULL)
-                    waiter = list_first_entry(&mysema_arr[sema_id].wait_list,
-                            mysemaphore_waiter_t, list);
-                printk("OS_PRI\n");
-                break;
-
-            case USER_PRI:
-                list_for_each_entry(iter_wait, &mysema_arr[sema_id].wait_list, list)
-                { if(iter_wait->userprio > priority)
-                    {
-                        waiter = iter_wait;
-                        priority = iter_wait->userprio;
-                    }
-                }
-                if(waiter == NULL)
-                    waiter = list_first_entry(&mysema_arr[sema_id].wait_list,
-                            mysemaphore_waiter_t, list);
-                printk("USER_PRI\n");
-                break;
-
-        } 
-        if(waiter == NULL)
-            printk("waiter is NULL\n");
-        else
-            if(waiter->task == NULL)
-                printk("task is NULL\n");
-        
-        list_del(&waiter->list);
-        printk("mysema_up: list_del\n");
-        waiter->up = true;
-        printk("mysema_up: waiter->up\n");
-        wake_up_process(waiter->task);
-        printk("mysema up: wake_up_process\n");
-    }
-    raw_spin_unlock_irqrestore(&mysema_arr[sema_id].lock, flags);
-
-    printk("sema %d up end\n", sema_id);
-    return 0;
+	// deactivate the semaphore.
+	my_sema[sema_id].isActive = false;
+	return 0;
 }
-
-asmlinkage long sys_mysema_release(int sema_id)
-{
-    static bool is_first = true;
-
-    if(sema_id < 0 || sema_id > 9)
-    {
-        printk("sema_release: wrong sema_id\n");
-        return -1;
-    }
-
-    if(mysema_arr[sema_id].is_active == false)
-    {
-        printk("sema_release: inactive sema\n");
-        return -1;
-    }
-
-    if (!is_first && !likely(list_empty(&mysema_arr[sema_id].wait_list)))
-    {
-        printk("sema_release: remaining jobs\n");
-        return -1;
-    }
-
-    mysema_arr[sema_id].is_active = false;
-    is_first = false;
-
-    return 0;
-}
-
